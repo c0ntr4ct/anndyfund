@@ -8,10 +8,13 @@ const CONTRACT_ADDRESS = "0x5AF9Ef13C0b7F82d3a3c52D93F27039bc8A71d63"; // ANNDY
 const DEV_WALLET = "0x3da1D16C93CB5Dd30457bD7E2670663026b22E2c";
 const START_BLOCK = 41000000;
 const TARGET_BNB = 100;
-
 const API_KEY =
   process.env.NEXT_PUBLIC_ETHERSCAN_KEY ||
   "NV1B51YDE2EI7AQR9J3J2X5BQGBCWA9CWH";
+
+// Throttle / caché: 15 minutos (ajusta a 10 * 60_000 si prefieres 10’)
+const STALE_MS = 15 * 60_000;
+const CACHE_KEY = "anndy:donations:v1";
 
 type Donation = {
   hash: string;
@@ -25,17 +28,14 @@ type Donation = {
 function formatBNBFromWei(wei: string): number {
   return Number(wei) / 1e18;
 }
-
 function bnbStr(weiOrBNB: string | number, decimals = 4) {
   const n =
     typeof weiOrBNB === "string" ? formatBNBFromWei(weiOrBNB) : Number(weiOrBNB);
   return n.toLocaleString(undefined, { maximumFractionDigits: decimals });
 }
-
 function shortHash(h: string) {
   return `${h.slice(0, 6)}…${h.slice(-4)}`;
 }
-
 function ProgressBar({ value, max }: { value: number; max: number }) {
   const pct = Math.min(100, Math.max(0, (value / (max || 1)) * 100));
   return (
@@ -50,6 +50,7 @@ export default function Page() {
   const [error, setError] = useState<string>("");
   const [donations, setDonations] = useState<Donation[]>([]);
   const [totalBNB, setTotalBNB] = useState<number>(0);
+  const [usingCache, setUsingCache] = useState<boolean>(false);
 
   const valid = useMemo(() => {
     return (
@@ -59,57 +60,138 @@ export default function Page() {
     );
   }, []);
 
-  async function fetchDonations() {
+  // Guarda en caché del navegador
+  function saveCache(payload: { donations: Donation[]; totalBNB: number }) {
+    try {
+      const toStore = {
+        ts: Date.now(),
+        data: payload,
+      };
+      localStorage.setItem(CACHE_KEY, JSON.stringify(toStore));
+    } catch {}
+  }
+
+  // Intenta leer caché y devolverla si está “fresca”
+  function loadCacheIfFresh(): { used: boolean } {
+    try {
+      const raw = localStorage.getItem(CACHE_KEY);
+      if (!raw) return { used: false };
+      const { ts, data } = JSON.parse(raw);
+      if (typeof ts !== "number" || !data) return { used: false };
+      const age = Date.now() - ts;
+      if (age <= STALE_MS && Array.isArray(data.donations)) {
+        setDonations(data.donations);
+        setTotalBNB(data.totalBNB || 0);
+        setUsingCache(true);
+        return { used: true };
+      }
+    } catch {}
+    return { used: false };
+  }
+
+  // Llamada real a API (con backoff ligero)
+  async function fetchFromAPI() {
+    const url = new URL(ETHERSCAN_V2_BASE);
+    url.searchParams.set("chainid", "56"); // BSC
+    url.searchParams.set("module", "account");
+    url.searchParams.set("action", "txlistinternal");
+    url.searchParams.set("address", CONTRACT_ADDRESS);
+    url.searchParams.set("startblock", String(START_BLOCK || 1));
+    url.searchParams.set("endblock", "99999999");
+    url.searchParams.set("sort", "asc");
+    url.searchParams.set("apikey", API_KEY);
+
+    const res = await fetch(url.toString(), { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = (await res.json()) as {
+      status?: string;
+      message?: string;
+      result?: any[];
+    };
+    if (!(data.status === "1" || data.message === "OK")) {
+      throw new Error(
+        (data.result as any as string) || data.message || "API Error"
+      );
+    }
+
+    const rows = (data.result || []).filter((tx: any) => {
+      return (
+        String(tx.to || "").toLowerCase() === DEV_WALLET.toLowerCase() &&
+        tx.isError === "0" &&
+        tx.value &&
+        tx.value !== "0"
+      );
+    });
+
+    const mapped: Donation[] = rows.map((tx: any) => ({
+      hash: tx.hash,
+      timeStamp: Number(tx.timeStamp) * 1000,
+      valueWei: tx.value,
+      valueBNB: formatBNBFromWei(tx.value),
+      from: tx.from,
+      to: tx.to,
+    }));
+
+    const total = mapped.reduce((acc, r) => acc + r.valueBNB, 0);
+    // Mostramos primero las más recientes
+    const latestFirst = [...mapped].reverse();
+
+    return { donations: latestFirst, totalBNB: total };
+  }
+
+  // Lógica principal: usa caché si está fresca; si no, llama red y actualiza caché.
+  async function fetchIfStale() {
     if (!valid) return;
+
+    setUsingCache(false);
     setError("");
     setLoading(true);
-    try {
-      const url = new URL(ETHERSCAN_V2_BASE);
-      url.searchParams.set("chainid", "56");
-      url.searchParams.set("module", "account");
-      url.searchParams.set("action", "txlistinternal");
-      url.searchParams.set("address", CONTRACT_ADDRESS);
-      url.searchParams.set("startblock", String(START_BLOCK || 1));
-      url.searchParams.set("endblock", "99999999");
-      url.searchParams.set("sort", "asc");
-      url.searchParams.set("apikey", API_KEY);
 
-      const res = await fetch(url.toString());
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as {
-        status?: string;
-        message?: string;
-        result?: any[];
+    // 1) Si la caché está fresca, úsala y evita la red
+    const hadFresh = loadCacheIfFresh();
+    if (hadFresh.used) {
+      setLoading(false);
+      return;
+    }
+
+    // 2) Si no hay caché fresca, consulta la red (con 2 reintentos rápidos)
+    try {
+      const attempt = async (delayMs: number) => {
+        try {
+          if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
+          return await fetchFromAPI();
+        } catch (e) {
+          return Promise.reject(e);
+        }
       };
 
-      if (!(data.status === "1" || data.message === "OK")) {
-        throw new Error(
-          (data.result as any as string) || data.message || "API Error"
-        );
+      let result;
+      try {
+        result = await attempt(0);
+      } catch {
+        try {
+          result = await attempt(1000); // reintento 1s
+        } catch {
+          result = await attempt(3000); // reintento 3s
+        }
       }
 
-      const rows = (data.result || []).filter((tx: any) => {
-        return (
-          String(tx.to || "").toLowerCase() === DEV_WALLET.toLowerCase() &&
-          tx.isError === "0" &&
-          tx.value &&
-          tx.value !== "0"
-        );
-      });
-
-      const mapped: Donation[] = rows.map((tx: any) => ({
-        hash: tx.hash,
-        timeStamp: Number(tx.timeStamp) * 1000,
-        valueWei: tx.value,
-        valueBNB: formatBNBFromWei(tx.value),
-        from: tx.from,
-        to: tx.to,
-      }));
-
-      const total = mapped.reduce((acc, r) => acc + r.valueBNB, 0);
-      setDonations(mapped.reverse());
-      setTotalBNB(total);
+      setDonations(result.donations);
+      setTotalBNB(result.totalBNB);
+      saveCache(result);
     } catch (e: any) {
+      // Si falla la red, intenta cargar caché “vieja” (aunque esté pasada)
+      try {
+        const raw = localStorage.getItem(CACHE_KEY);
+        if (raw) {
+          const { data } = JSON.parse(raw);
+          if (data && Array.isArray(data.donations)) {
+            setDonations(data.donations);
+            setTotalBNB(data.totalBNB || 0);
+            setUsingCache(true);
+          }
+        }
+      } catch {}
       setError(e?.message || String(e));
     } finally {
       setLoading(false);
@@ -117,7 +199,11 @@ export default function Page() {
   }
 
   useEffect(() => {
-    fetchDonations();
+    // Al montar: carga si está “stale” y programa refresh cada 15 min
+    fetchIfStale();
+    const t = setInterval(fetchIfStale, STALE_MS);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const last = donations[0];
@@ -126,42 +212,12 @@ export default function Page() {
     <main className="min-h-screen bg-white text-black">
       <div className="max-w-5xl mx-auto p-6 grid gap-6">
 
-        {/* --- Social Icons (X + DexScreener) --- */}
-        <div className="flex items-center justify-end gap-4">
-          {/* X (Twitter) */}
-          <a
-            href="https://x.com/AnndyFund"
-            target="_blank"
-            rel="noreferrer"
-            className="w-14 h-14 flex items-center justify-center rounded-full bg-black hover:bg-neutral-800 transition"
-            title="X (Twitter)"
-          >
-            <img
-              src="/xlogo.svg"
-              alt="X Logo"
-              className="w-8 h-8 invert"
-              width={32}
-              height={32}
-            />
-          </a>
-
-          {/* Dexscreener */}
-          <a
-            href="https://dexscreener.com/bsc/0xa5909b4bcc35515d9f7856a07ee468e71076d0d2"
-            target="_blank"
-            rel="noreferrer"
-            className="w-14 h-14 flex items-center justify-center rounded-full bg-black hover:bg-neutral-800 transition"
-            title="DexScreener"
-          >
-            <img
-              src="/dexscreener.svg"
-              alt="DexScreener"
-              className="w-8 h-8 invert"
-              width={32}
-              height={32}
-            />
-          </a>
-        </div>
+        {/* Aviso pequeño si estamos usando caché */}
+        {usingCache && (
+          <div className="p-3 rounded-xl text-sm bg-yellow-50 text-yellow-900 border border-yellow-200">
+            Using cached data (API temporarily limited). Auto-refresh every {Math.round(STALE_MS/60000)} minutes.
+          </div>
+        )}
 
         {/* Contract line */}
         <div className="text-sm md:text-base">
@@ -227,10 +283,8 @@ export default function Page() {
             {loading && (
               <div className="p-4 text-sm text-gray-600">Loading…</div>
             )}
-            {error && (
-              <div className="p-4 text-sm text-red-700 bg-red-50">
-                {error}
-              </div>
+            {error && !usingCache && (
+              <div className="p-4 text-sm text-red-700 bg-red-50">Error: {error}</div>
             )}
             {!loading && donations.length === 0 && !error && (
               <div className="p-4 text-sm text-gray-600">No data available.</div>
